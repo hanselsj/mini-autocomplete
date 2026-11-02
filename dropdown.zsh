@@ -318,6 +318,9 @@ _mac_update() {
   _mac_filter
   (( $#_mac_view )) || { _mac_close; return; }
   zle -R            # (the pre-redraw hook clears the old box here)
+  # Measure the prompt now, not at line start: async prompts (oh-my-zsh's git
+  # info) fill in a moment after the prompt appears.
+  _mac_prompt_width
   _mac_open=1
   _mac_render
 }
