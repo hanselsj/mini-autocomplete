@@ -200,6 +200,10 @@ _mac_filter() {
 _mac_prompt_width() {
   setopt localoptions extendedglob
   local p=${(%)${(e)PS1}}
+  # Invisible escape codes take no columns: OSC sequences (VS Code / iTerm2
+  # shell-integration markers like ESC]633;A BEL, window titles) and CSI colors.
+  p=${p//$'\e]'[^$'\a\e']#$'\a'/}
+  p=${p//$'\e]'[^$'\a\e']#$'\e\\'/}
   p=${p//$'\e'\[[0-9;?]#[a-zA-Z]/}
   p=${p##*$'\n'}
   _mac_pw=${(m)#p}
