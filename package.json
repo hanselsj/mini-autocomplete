@@ -1,0 +1,18 @@
+{
+  "name": "mini-autocomplete",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Kiro/Fig-style autocomplete dropdown for zsh, powered by the withfig/autocomplete specs",
+  "type": "module",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/hanselsj/mini-autocomplete.git"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@withfig/autocomplete": "^2.692.3"
+  }
+}
