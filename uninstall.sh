@@ -17,7 +17,7 @@ if [[ -f "$zshrc" ]] && grep -q 'mini-autocomplete' "$zshrc"; then
 fi
 
 pkill -f "$dir/server.mjs" 2>/dev/null || true
-rm -f "${TMPDIR:-/tmp}/mini-ac-$(id -u).sock"
+rm -f "${TMPDIR:-/tmp}/mini-ac-$(id -u)"*.sock
 
 if [[ "$dir" == "$default_home" ]]; then
   rm -rf "$dir"

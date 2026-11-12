@@ -8,22 +8,32 @@
 #                            matches the selection exactly
 #   Esc                      hide the box until the next word
 #
+# Typing never waits on suggestions: each keystroke sends the line to the
+# background server (server.mjs) and returns straight away; the box is drawn
+# when the reply arrives (zle -F), and replies that are already out of date
+# are thrown away.
+#
 # Sourced by mini-autocomplete.zsh; expects MINI_AC_DIR / MINI_AC_NODE / MINI_AC_SPECS.
 
 [[ -o interactive && -n $MINI_AC_NODE ]] || return 0
-zmodload zsh/net/socket zsh/zselect 2>/dev/null || return 0
+zmodload zsh/net/socket zsh/zselect zsh/system 2>/dev/null || return 0
 
 typeset -gi MINI_AC_ROWS=${MINI_AC_ROWS:-8}
-typeset -g  _mac_sock=${TMPDIR:-/tmp}/mini-ac-$UID.sock
+# Versioned so a server left running by an older release is never asked.
+typeset -g  _mac_sock=${TMPDIR:-/tmp}/mini-ac-$UID-v2.sock
 typeset -gi _mac_open=0 _mac_drawn=0 _mac_sel=1 _mac_top=1 _mac_nav=0 _mac_dismiss=-1 _mac_pw=0
-typeset -g  _mac_key= _mac_files= _mac_prefix= _mac_lastprefix= _mac_buf= _mac_cur=
-typeset -ga _mac_items _mac_view _mac_words
+typeset -gi _mac_reqid=0
+typeset -g  _mac_key= _mac_prefix= _mac_lastprefix= _mac_buf= _mac_cur= _mac_fd= _mac_rbuf=
+typeset -ga _mac_view _mac_words
 
-# ---------- talking to the completion server ----------
+# ---------- talking to the suggestion server ----------
 
+# Start the server in the background. With "wait", block (briefly, once) until it's listening.
 _mac_start_server() {
+  [[ -S $_mac_sock ]] && zsocket $_mac_sock 2>/dev/null && { exec {REPLY}>&-; return 0; }
   rm -f -- $_mac_sock
   ( cd / && exec "$MINI_AC_NODE" "$MINI_AC_DIR/server.mjs" "$_mac_sock" ) &>/dev/null &!
+  [[ $1 == wait ]] || return 0
   local i
   for i in {1..40}; do
     [[ -S $_mac_sock ]] && return 0
@@ -32,20 +42,66 @@ _mac_start_server() {
   return 1
 }
 
-# _mac_request <prefix> <words...>  ->  $reply (one entry per line)
-_mac_request() {
-  local req="$PWD"$'\x1f'"$1" line fd
-  shift
-  req+=$'\x1f'"${(pj:\x1f:)@}"
-  reply=()
+# Drop the request in flight, if any.
+_mac_cancel() {
+  [[ -n $_mac_fd ]] || return 0
+  zle -F $_mac_fd 2>/dev/null
+  exec {_mac_fd}>&- 2>/dev/null
+  _mac_fd= _mac_rbuf=
+}
+
+# Send the current line to the server without waiting for the answer.
+_mac_send() {   # $1: 1 = new word, re-run the spec's generators
+  _mac_cancel
   if ! zsocket $_mac_sock 2>/dev/null; then
-    _mac_start_server && zsocket $_mac_sock 2>/dev/null || return 1
+    _mac_start_server wait && zsocket $_mac_sock 2>/dev/null || return 1
   fi
-  fd=$REPLY
-  print -rn -u $fd -- "$req"$'\n'
-  while IFS= read -r -u $fd line; do reply+=("$line"); done
-  exec {fd}>&-
-  return 0
+  _mac_fd=$REPLY
+  (( ++_mac_reqid ))
+  print -rn -u $_mac_fd -- "$_mac_reqid"$'\x1f'"$1"$'\x1f'"$PWD"$'\x1f'"$_mac_prefix"$'\x1f'"${(pj:\x1f:)_mac_words}"$'\n'
+  zle -F -w $_mac_fd _mac_on_reply
+}
+
+# zle -F handler: collect the reply as it arrives; draw it once complete.
+_mac_on_reply() {
+  local fd=$1 chunk
+  if [[ $fd != $_mac_fd ]]; then   # a reply nobody is waiting for any more
+    zle -F $fd 2>/dev/null
+    exec {fd}>&- 2>/dev/null
+    return 0
+  fi
+  if sysread -i $fd -s 65536 chunk; then
+    _mac_rbuf+=$chunk
+    return 0
+  fi
+  _mac_show_reply
+}
+
+# For keys that act on the list (Tab/Enter/arrows): if a reply is still on its
+# way, wait for it (it's usually a millisecond or two) so they act on fresh results.
+_mac_settle() {
+  [[ -n $_mac_fd ]] || return 0
+  local chunk
+  while sysread -i $_mac_fd -s 65536 -t 1 chunk; do _mac_rbuf+=$chunk; done
+  _mac_show_reply
+}
+
+_mac_show_reply() {
+  local -a lines
+  lines=("${(@f)_mac_rbuf}")
+  _mac_cancel
+  [[ $lines[1] == "#$_mac_reqid" ]] || return 0
+  _mac_view=("${(@)lines[2,-1]}")
+  _mac_view=(${_mac_view:#})
+  if (( ! $#_mac_view )); then
+    _mac_close
+    return 0
+  fi
+  # Measure the prompt now, not at line start: async prompts (oh-my-zsh's git
+  # info) fill in a moment after the prompt appears.
+  _mac_prompt_width
+  _mac_open=1
+  _mac_render
 }
 
 mini-ac-restart() {
@@ -86,113 +142,6 @@ _mac_context() {
   fi
   _mac_words[1]=${_mac_words[1]:t}
   _mac_prefix=$prefix
-}
-
-_mac_fetch() {
-  local key=$PWD$'\x1f'${(pj:\x1f:)_mac_words}
-  [[ $key == $_mac_key ]] && return 0
-  _mac_key=$key
-  _mac_items=()
-  _mac_files=
-  _mac_request "" "${_mac_words[@]}" || return 1
-  local line
-  for line in "${reply[@]}"; do
-    case $line in
-      @files|@nospec) _mac_files=files ;;
-      @folders)       _mac_files=${_mac_files:-folders} ;;
-      ?$'\t'*)        _mac_items+=("$line") ;;
-    esac
-  done
-  # Generators like cd's only list ./ — when every argument looks like a path,
-  # list from disk instead so `cd Repos/<...>` works.
-  local -a args=(${(M)_mac_items:#a$'\t'*})
-  local -a dirs=(${(M)args:#a$'\t'*/$'\t'*})
-  if (( $#args && $#dirs == $#args )); then
-    _mac_items=(${_mac_items:#a$'\t'*})
-    _mac_files=${_mac_files:-folders}
-  fi
-}
-
-# ---------- filtering ----------
-
-# _mac_score <lowercased name> <lowercased query> <fuzzy pattern>
-# Sets REPLY to a sortable rank (tier + score) or fails when there's no match:
-#   0 starts with the query   1 query starts a word (after - _ . / : @ space)
-#   2 contains the query      3 fuzzy: query letters in order (tightest first)
-_mac_score() {
-  local n=$1 lq=$2 fpat=$3 p
-  if [[ -z $lq || $n == ${lq}* ]]; then
-    REPLY=0000
-  elif [[ $n == *[-_./:@\ ]${lq}* ]]; then
-    p=${n%%[-_./:@ ]${lq}*}
-    REPLY=1${(l:3::0:)${#p}}
-  elif [[ $n == *${lq}* ]]; then
-    p=${n%%${lq}*}
-    REPLY=2${(l:3::0:)${#p}}
-  elif [[ $n == *${~fpat}* ]]; then
-    p=${(SM)n#${~fpat}}
-    REPLY=3${(l:3::0:)${#p}}
-  else
-    return 1
-  fi
-}
-
-# Builds _mac_view, best match first: entries "kind<TAB>name<TAB>description<TAB>text-to-insert".
-_mac_filter() {
-  setopt localoptions extendedglob
-  local raw=$_mac_prefix q=${(Q)_mac_prefix}
-  local lq=${(L)q} item kind rest name desc pass ins
-  local fpat=${(j:*:)${(@b)${(s::)lq}}}
-  local -a ranked ents
-  local -i idx=0
-
-  for pass in 0 1; do
-    ranked=()
-    local want_opts=$pass
-    [[ $q == -* ]] && want_opts=1
-    for item in "${_mac_items[@]}"; do
-      kind=${item[1]}
-      rest=${item[3,-1]}
-      name=${rest%%$'\t'*}
-      desc=${rest#*$'\t'}
-      if (( want_opts )); then [[ $kind == o ]] || continue
-      else [[ $kind == o ]] && continue; fi
-      (( idx++ ))
-      _mac_score "${(L)name}" "$lq" "$fpat" || continue
-      # $VARS are inserted as-is, everything else shell-quoted.
-      if [[ $name == \$* ]]; then ins=$name; else ins=${(q)name}; fi
-      ranked+=("$REPLY${(l:5::0:)idx}"$'\x1f'"$kind"$'\t'"$name"$'\t'"$desc"$'\t'"$ins")
-    done
-
-    if [[ -n $_mac_files && $q != -* ]] && (( pass == 0 )); then
-      local dir= base=$q rawdir=
-      if [[ $q == */* ]]; then dir=${q%/*}/; base=${q##*/}; rawdir=${raw%/*}/; fi
-      local gdir=${dir/#\~/$HOME}
-      local bq=${(L)base}
-      local bpat=${(j:*:)${(@b)${(s::)bq}}}
-      local qual=N
-      [[ $base == .* ]] && qual+=D
-      [[ $_mac_files == folders ]] && qual+=-/
-      ents=( ${gdir:-./}*(${~qual}) )
-      local e n
-      for e in ${ents[1,1000]}; do
-        n=${e:t}
-        (( idx++ ))
-        _mac_score "${(L)n}" "$bq" "$bpat" || continue
-        if [[ -d $e ]]; then
-          ranked+=("$REPLY${(l:5::0:)idx}"$'\x1f'"d"$'\t'"$n/"$'\t'$'\t'"$rawdir${(q)n}/")
-        else
-          ranked+=("$REPLY${(l:5::0:)idx}"$'\x1f'"f"$'\t'"$n"$'\t'$'\t'"$rawdir${(q)n}")
-        fi
-      done
-    fi
-
-    # With nothing else to show, fall back to the options.
-    (( $#ranked )) && break
-    [[ $q == -* ]] && break
-  done
-  ranked=(${(o)ranked})
-  _mac_view=("${(@)ranked#*$'\x1f'}")
 }
 
 # ---------- drawing ----------
@@ -308,25 +257,29 @@ _mac_close() {
   _mac_nav=0
 }
 
+# Called after every edit: work out the word being typed and ask for suggestions.
+# Never waits — the reply is drawn by _mac_on_reply.
 _mac_update() {
-  if (( PENDING || KEYS_QUEUED_COUNT )); then _mac_close; return; fi
-  _mac_context || { _mac_close; return; }
+  # Keys still queued (fast typing, paste): skip, the last one will ask.
+  (( PENDING || KEYS_QUEUED_COUNT )) && { _mac_buf=$BUFFER _mac_cur=$CURSOR; return; }
+  _mac_context || { _mac_cancel; _mac_close; return; }
   local -i start=$(( ${#LBUFFER} - ${#_mac_prefix} ))
-  (( start == _mac_dismiss )) && { _mac_close; return; }
+  (( start == _mac_dismiss )) && { _mac_cancel; _mac_close; return; }
   _mac_dismiss=-1
-  _mac_fetch || { _mac_close; return; }
+
+  local key=$PWD$'\x1f'${(pj:\x1f:)_mac_words} fresh=0
+  if [[ $key != $_mac_key ]]; then
+    # New word: the old list belongs to the previous word, hide it.
+    _mac_key=$key fresh=1
+    _mac_close
+  fi
   if [[ $_mac_prefix != $_mac_lastprefix ]]; then
     _mac_sel=1 _mac_top=1 _mac_nav=0
   fi
   _mac_lastprefix=$_mac_prefix
-  _mac_filter
-  (( $#_mac_view )) || { _mac_close; return; }
-  zle -R            # (the pre-redraw hook clears the old box here)
-  # Measure the prompt now, not at line start: async prompts (oh-my-zsh's git
-  # info) fill in a moment after the prompt appears.
-  _mac_prompt_width
-  _mac_open=1
-  _mac_render
+  # Same word: leave the current box up until the new list replaces it.
+  _mac_buf=$BUFFER _mac_cur=$CURSOR
+  _mac_send $fresh || _mac_close
 }
 
 _mac_accept() {
@@ -356,6 +309,7 @@ _mac_backward_delete_char() {
 }
 
 _mac_up() {
+  _mac_settle
   if (( _mac_open )); then
     (( _mac_sel = _mac_sel > 1 ? _mac_sel - 1 : $#_mac_view ))
     _mac_nav=1
@@ -366,6 +320,7 @@ _mac_up() {
 }
 
 _mac_down() {
+  _mac_settle
   if (( _mac_open )); then
     (( _mac_sel = _mac_sel < $#_mac_view ? _mac_sel + 1 : 1 ))
     _mac_nav=1
@@ -376,6 +331,7 @@ _mac_down() {
 }
 
 _mac_tab() {
+  _mac_settle
   if (( _mac_open )); then
     _mac_accept
   else
@@ -384,6 +340,7 @@ _mac_tab() {
 }
 
 _mac_enter() {
+  _mac_settle
   if (( _mac_open )); then
     local e=$_mac_view[_mac_sel]
     local name=${${e[3,-1]}%%$'\t'*}
@@ -405,23 +362,29 @@ _mac_enter() {
 }
 
 _mac_escape() {
-  (( _mac_open )) || return 0
+  (( _mac_open )) || [[ -n $_mac_fd ]] || return 0
   _mac_dismiss=$(( ${#LBUFFER} - ${#_mac_prefix} ))
+  _mac_cancel
   _mac_close
 }
 
 _mac_line_init() {
+  _mac_cancel
   _mac_open=0 _mac_drawn=0 _mac_dismiss=-1 _mac_nav=0
   _mac_key= _mac_lastprefix=$'\0'
-  _mac_prompt_width
+  # Warm the server up in the background so the first suggestion is instant.
+  [[ -S $_mac_sock ]] || _mac_start_server
 }
 
-_mac_line_finish() { _mac_close; }
+_mac_line_finish() { _mac_cancel; _mac_close; }
 
-# Anything else that changes the line (Ctrl-W, Ctrl-U, history, arrows) hides the box.
+# Anything else that changes the line (Ctrl-W, Ctrl-U, history, arrows) hides the
+# box and drops any reply still on its way.
 _mac_pre_redraw() {
-  (( _mac_drawn )) || return 0
-  [[ $BUFFER == $_mac_buf && $CURSOR == $_mac_cur ]] || _mac_close
+  (( _mac_drawn )) || [[ -n $_mac_fd ]] || return 0
+  [[ $BUFFER == $_mac_buf && $CURSOR == $_mac_cur ]] && return 0
+  _mac_cancel
+  _mac_close
 }
 
 # ---------- install ----------
@@ -442,6 +405,7 @@ zle -N _mac_escape
 zle -N _mac_line_init
 zle -N _mac_line_finish
 zle -N _mac_pre_redraw
+zle -N _mac_on_reply
 
 typeset -g _mac_orig_up=${_mac_orig_up:-$(_mac_bound '^[[A')}
 typeset -g _mac_orig_down=${_mac_orig_down:-$(_mac_bound '^[[B')}

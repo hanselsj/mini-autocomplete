@@ -46,12 +46,12 @@ Set `MINI_AC_ROWS` (default 8) before the `source` line to change the box height
 
 ## How it works
 
-- `dropdown.zsh` hooks the line editor (typing, space, backspace, arrows, Tab, Enter, Esc) and draws the box with terminal escape codes.
-- `server.mjs` is a background Node process on a per-user Unix socket. It starts on first use and exits after an hour idle, so typing never pays Node's startup cost. Suggestions are fetched once per word and filtered in zsh as you type.
+- `dropdown.zsh` hooks the line editor (typing, space, backspace, arrows, Tab, Enter, Esc) and draws the box with terminal escape codes. Typing never waits for suggestions: each keystroke sends the line to the server and returns immediately, and the box is drawn when the reply arrives (`zle -F`). Replies that are out of date by then are discarded.
+- `server.mjs` is a background Node process on a per-user Unix socket. It starts with your first prompt and exits after an hour idle. `suggest.mjs` does the fuzzy ranking and the file and folder listing there. It caches each command's spec results per word, so re-ranking on a keystroke takes about a millisecond and never re-runs things like `git branch`.
 - `complete.mjs` walks a Fig spec: subcommands, `loadSpec`, options and their values, `--`, and `sudo`-style commands. It runs `script`/`postProcess`/`splitOn`/`custom` generators for things like git branches and npm scripts.
 - `mini-autocomplete.zsh` is the entry point. When the box is closed, it also adds a regular Tab completer driven by the same specs.
 
-After changing `complete.mjs`, run `mini-ac-restart` so the server reloads it.
+After changing `complete.mjs` or `suggest.mjs`, run `mini-ac-restart` so the server reloads it.
 
 ## Limitations
 
